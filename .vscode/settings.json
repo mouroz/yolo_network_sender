@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        "./yolov5_submodule",
+        "./communication_submodule"
+    ]
+}
