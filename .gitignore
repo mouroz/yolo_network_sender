@@ -3,3 +3,4 @@ venv/
 .venv/
 yolo_out/
 yolo_in/
+__pycache__/

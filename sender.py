@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 import argparse
-
+import traceback 
 # 1. Define the path to the submodule
 # distinct from the current script location
 FILE = Path(__file__).resolve()
@@ -19,49 +19,119 @@ if str(COMM_DIR) not in sys.path:
 
 
 import run_yolo
-import async_communication as comm
+from async_communication import AsyncSender
 import image_input as img
 
 
 
-CURRENT_RUN_NAME = ''
-CURRENT_RUN_FOLDER = ''
-TRANSFER_QUEUE = []
-WORKERS = 2
-BATCH = 2
+YOLO_IN = ROOT / 'yolo_in'
+YOLO_OUT = ROOT / 'yolo_out'
+PREFIX = 'run'
 
-def init_global_variables():
-    CURRENT_RUN_NAME = img.get_current_run_folder_name()
-    CURRENT_RUN_FOLDER = img.YOLO_IN / CURRENT_RUN_NAME
+class BatchManager:
+    def __init__(self, sender: AsyncSender, batch_size=2, workers=2, transfer_batch_size=4):
+        # Configuration (Defaults that can be overridden)
+        self.batch_size = batch_size
+        self.workers = workers
+        self.transfer_batch_size=transfer_batch_size # Amount of images added to current run before its sent to yolo automatically
+        self.transfer_queue = []
+        self.sender = sender
+        
+        
+        # State: Initialize the first run folder immediately upon creation
+        self.current_run_name = img.get_max_increment_folder_name(YOLO_IN, PREFIX)
+        if self.current_run_name == "":
+            self.current_run_name = PREFIX + "1"
+            
+        self.current_folder = YOLO_IN / self.current_run_name
+        self.result_folder = YOLO_OUT / self.current_run_name
+        
+        print(f"Initialized BatchManager. Output: {self.current_folder}")
+        
 
-async def start_connection(HOST='127.0.0.1', PORT=5555):
-    # 2. Start Server in background
-    sender = comm.AsyncSender(HOST, PORT)
-    await sender.connect()
-
-
-def run_and_update():
-    comm_status = img.start_run(run_name=CURRENT_RUN_FOLDER, transfer_queue=TRANSFER_QUEUE, batch=BATCH, workers=WORKERS)
-    CURRENT_RUN_NAME = img.create_new_run_folder()
-    CURRENT_RUN_FOLDER =  img.YOLO_IN / CURRENT_RUN_NAME
-    return comm_status
     
-def add_file(path):
-    img.copy_image(path, CURRENT_RUN_FOLDER)
-    if img.is_run_folder_ready(CURRENT_RUN_FOLDER):
-        print(f'Got a sizable batch of {img.get_image_count(CURRENT_RUN_FOLDER)}, starting run')
-        return run_and_update()
-    return False
 
-def add_folder(path):
-    img.copy_images(path, CURRENT_RUN_FOLDER)
-    if img.is_run_folder_ready(CURRENT_RUN_FOLDER):
-        print(f'Got a sizable batch of {img.get_image_count(CURRENT_RUN_FOLDER)}, starting run')
-        return run_and_update()
-    return False        
+    async def _run_and_rotate_folder(self):        
+        # Ensure output folder exists before running YOLO
+        self.result_folder.mkdir(parents=True, exist_ok=True)
+        
+        run_yolo.run_yolo(
+            weights=ROOT / 'yolo_model/weights/best.pt',    # Path to your trained model
+            source=self.current_folder,   # Path to images
+            project=self.result_folder,
+            name='',
+            batch_size=self.batch_size,
+            workers=self.workers,
+            exist_ok=True
+        )
+        
+        self.current_run_name = img.create_new_increment_folder(YOLO_IN, PREFIX)
+        
+        error=False
+        try:
+            await self.sender.send_folder_recursive(str(self.current_folder))
+            await self.sender.send_folder_recursive(str(self.result_folder))
+            
+        except Exception as e:
+            print(f"COMMUNICATION ERROR: {e}")
+            traceback.print_exc()
+            self.transfer_queue.append(self.current_folder)
+            self.transfer_queue.append(self.result_folder)
+            error = True    
+        
+        finally:
+            self.current_folder =  YOLO_IN / self.current_run_name
+            self.result_folder = YOLO_OUT / self.current_run_name
+    
+            
+        return error
+    
+   
+        
+    def is_run_folder_ready(self):
+        print(img.get_image_count(self.current_folder))
+        return img.get_image_count(self.current_folder) >= self.transfer_batch_size
+    
+    async def async_add_file(self, path):
+        img.copy_image(path, self.current_folder)
+        if self.is_run_folder_ready():
+            print(f'Got a sizable batch of {img.get_image_count(self.current_folder)}, starting run')
+            return await self._run_and_rotate_folder()
+        return False
 
-def force_run():
-    return run_and_update()
+    async def async_add_folder(self, path):
+        img.copy_images(path, self.current_folder)
+        if self.is_run_folder_ready():
+            print(f'Got a sizable batch of {img.get_image_count(self.current_folder)}, starting run')
+            return await self._run_and_rotate_folder()
+        return False        
+
+    async def async_force_run(self):
+        if img.get_image_count(self.current_folder) > 0:
+            return await self._run_and_rotate_folder()
+        else:
+            print("Current folder is empty. Nothing to force run.")
+            return False
+        
+    def resend_pending_transfer(transfer_queue):
+        """
+        Retries transfers in the queue.
+        transfer_queue should be a set to avoid duplicates.
+        """
+        # Create a copy of the list/set to iterate over, 
+        # so we can safely remove items from the original `transfer_queue`
+        folders_to_process = list(transfer_queue)
+        
+        for folder in folders_to_process:
+            try:
+                print(f"Retrying transfer for: {folder}")
+                sender.transfer_folder_recursive(folder)
+                # If successful, remove from the main queue
+                transfer_queue.remove(folder) 
+            except Exception as e:
+                print(f"Retry failed for {folder}: {e}")
+                # It stays in the queue for next time
+
 
 
 
@@ -72,7 +142,7 @@ def is_image(path):
     return os.path.exists(path) and os.path.isfile(path) and Path(path).suffix.lower() in valid_exts
 
 
-async def operation_terminal(sender_instance):
+async def operation_terminal(sender_instance:AsyncSender, manager:BatchManager):
     """
     Interactive terminal for manual control.
     Args:
@@ -122,28 +192,33 @@ async def operation_terminal(sender_instance):
         elif choice == '2':
             # Copy Image
             img_path = input("Enter image path: ").strip().strip("'").strip('"') # Clean quotes
-            
+            if not img_path.startswith("/"):
+                img_path = ROOT / img_path
+                
             if is_image(img_path):
-                dest = img.get_current_run_folder()
-                print(f"Copying to current batch: {dest.name}")
-                if img.copy_image(img_path, dest):
-                    print("✅ Image copied.")
-                else:
+                
+                print(f"Copying to current batch: {manager.current_folder}")
+                if await manager.async_add_file(img_path):
                     print("❌ Copy failed.")
+                else:
+                    print("✅ Image copied.")
             else:
-                print("❌ Invalid path or not an image file.")
+                print(f"❌ Invalid path or not an image file: {img_path}.")
 
         elif choice == '3':
             # Copy Folder
             folder_path = input("Enter folder path: ").strip().strip("'").strip('"')
+            if not folder_path.startswith("/"):
+                folder_path = ROOT / folder_path
             
             if os.path.exists(folder_path) and os.path.isdir(folder_path):
-                dest = img.get_current_run_folder()
-                print(f"Copying images to current batch: {dest.name}")
-                img.copy_images(folder_path, dest)
-                print("✅ Operation complete.")
+                print(f"Copying images to current batch: {manager.current_folder}")
+                if await manager.async_add_folder(folder_path):
+                    print("❌ Communication error!")
+                else:
+                    print("✅ Operation complete.")
             else:
-                print("❌ Invalid folder path.")
+                print(f"❌ Invalid folder path {folder_path}")
 
         elif choice == '4':
             # Force Run Detection
@@ -152,7 +227,7 @@ async def operation_terminal(sender_instance):
             # Using the start_run from utility_script
             # Note: start_run logic likely needs the run name, e.g., 'run5'
             try:
-                force_run()
+                await manager.async_force_run()
   
             except Exception as e:
                 print(f"❌ Error during run: {e}")
@@ -160,20 +235,20 @@ async def operation_terminal(sender_instance):
         elif choice == '5':
             # Retry Pending Queue
             print("Checking transfer queue...")
-            if not TRANSFER_QUEUE:
+            if not manager.transfer_queue:
                 print("ℹ️  Queue is empty. Nothing to send.")
             else:
-                print(f"Found {len(TRANSFER_QUEUE)} items pending.")
-                img.resend_pending_transfer(TRANSFER_QUEUE)
+                print(f"Found {len(manager.transfer_queue)} items pending.")
+                img.resend_pending_transfer(manager.transfer_queue)
                 print("✅ Retry attempt finished.")
 
         elif choice == '6':
             # List Cached Runs
-            if not img.YOLO_IN.exists():
+            if not YOLO_IN.exists():
                 print("ℹ️  YOLO_IN directory does not exist yet.")
             else:
-                runs = [d for d in img.YOLO_IN.iterdir() if d.is_dir() and d.name.startswith('run')]
-                print(f"\n📂 Cached Runs in {img.YOLO_IN}:")
+                runs = [d for d in YOLO_IN.iterdir() if d.is_dir() and d.name.startswith('run')]
+                print(f"\n📂 Cached Runs in {YOLO_IN}:")
                 for run in sorted(runs, key=lambda x: x.name):
                     # Count images inside
                     count = img.get_image_count(run)
@@ -183,7 +258,7 @@ async def operation_terminal(sender_instance):
         elif choice == '7':
             # Resend Specific Run
             run_name = input("Enter run name (e.g., 'run1'): ").strip()
-            folder_to_send = img.YOLO_OUT / run_name
+            folder_to_send = YOLO_OUT / run_name
             
             if not folder_to_send.exists():
                 print(f"❌ Folder not found: {folder_to_send}")
@@ -196,7 +271,7 @@ async def operation_terminal(sender_instance):
                 except Exception as e:
                     print(f"❌ Failed to send: {e}")
                     print("Adding to pending queue.")
-                    TRANSFER_QUEUE.add(folder_to_send)
+                    manager.transfer_queue.append(folder_to_send)
 
         elif choice == '0':
             print("Exiting terminal...")
@@ -205,26 +280,41 @@ async def operation_terminal(sender_instance):
         else:
             print("❌ Invalid option.")
             
-            
+
+
+
+
+        
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YOLO Transfer Client Terminal")
     parser.add_argument("host", type=str, help="Server IP address", default="127.0.0.1")
     parser.add_argument("port", type=int, help="Server Port", default=8888)
+    parser.add_argument("--folder-batch-size", type=int, help="Minimum number of Images before batching to send to model", default=4)
+    parser.add_argument("--yolo-batch-size", type=int, help="Size of batches used per detection", default=4)
+    parser.add_argument("--yolo-workers-count", type=int, help="Number of workers (thread) to run concurrently", default=2)
+    
 
     args = parser.parse_args()
-    init_global_variables()
+
     
     sender = None
     async def main():
-        sender = comm.AsyncSender(args.host, args.port)
+        sender = AsyncSender(args.host, args.port)
         
         print(f"Attempting connection to {args.host}:{args.port}...")
         try:
             await sender.connect()
             print("✅ Connection established.")
             
+            manager = BatchManager(
+                sender=sender,
+                batch_size=args.yolo_batch_size, 
+                workers=args.yolo_workers_count, 
+                transfer_batch_size=args.folder_batch_size
+            )
+                
             # Start the terminal loop
-            await operation_terminal(sender)
+            await operation_terminal(sender, manager)
             
         except (ConnectionRefusedError, OSError) as e:
             print(f"❌ CRITICAL: Could not connect to server.")
