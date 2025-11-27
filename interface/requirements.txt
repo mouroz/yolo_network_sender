@@ -1,0 +1,5 @@
+# YOLO Defect Detection Client Interface
+# Install with: pip install -r requirements.txt
+
+PyQt6>=6.4.0
+

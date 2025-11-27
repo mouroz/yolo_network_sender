@@ -69,8 +69,9 @@ class BatchManager:
         
         error=False
         try:
-            await self.sender.send_folder_recursive(str(self.current_folder))
-            await self.sender.send_folder_recursive(str(self.result_folder))
+            # Pass ROOT as base_path to preserve yolo_in/runX and yolo_out/runX structure
+            await self.sender.send_folder_recursive(str(self.current_folder), str(ROOT))
+            await self.sender.send_folder_recursive(str(self.result_folder), str(ROOT))
             
         except Exception as e:
             print(f"COMMUNICATION ERROR: {e}")
