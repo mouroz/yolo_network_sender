@@ -1,6 +1,7 @@
 [submodule "communication_submodule"]
+	branch = interface-master
 	path = communication_submodule
-	url = https://github.com/mouroz/py_communication_submodule.git
+	url = git@github.com:mouroz/py_communication_submodule.git
 [submodule "yolov5_submodule"]
 	path = yolov5_submodule
 	url = https://github.com/LuisAugusto0/yolov5.git
